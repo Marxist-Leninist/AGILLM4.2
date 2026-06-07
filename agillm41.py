@@ -3735,6 +3735,78 @@ def _sample(logits, T, top_k, top_p, min_p, greedy):
     if probs.sum() == 0: return logits.argmax(-1, keepdim=True)
     return probs.div_(probs.sum()).multinomial(1)
 
+
+def _dblock_block_layers(core, dblock_blocks):
+    """Partition the core's layer stack into `dblock_blocks` contiguous blocks."""
+    L = len(core.blocks)
+    B = max(1, int(dblock_blocks))
+    per = max(1, L // B)
+    groups = []
+    for b in range(B):
+        lo = b * per
+        hi = L if b == B - 1 else (b + 1) * per
+        groups.append(list(range(lo, hi)))
+    return groups
+
+
+def _dblock_select_block(sigma, bsig):
+    """Index of the block whose band [bsig[b], bsig[b+1]] contains sigma (clamped)."""
+    for b in range(len(bsig) - 1):
+        if bsig[b] <= sigma <= bsig[b + 1]:
+            return b
+    return 0 if sigma < bsig[0] else len(bsig) - 2
+
+
+def _edm_denoise_block(core, layers, z, sigma_t, mask, args):
+    """EDM-preconditioned denoiser D_b(z) in embedding space, matching _dblock_step.
+
+    D = c_skip*z + c_out*F(c_in*z), where F runs only this block's layers. Returns
+    the clean-target estimate (pre-LayerNorm) so it can be used in the Euler ODE."""
+    cs, co, ci = _edm_pre(sigma_t)
+    h = ci * z
+    for li in layers:
+        h = _run_block(core.blocks[li], h, mask, False, args)
+    return cs * z + co * h
+
+
+@torch.no_grad()
+def _dblock_euler_hidden(core, ids, args):
+    """Final hidden representation via the DiffusionBlocks EDM Euler block-chain.
+
+    Faithful to the paper's reverse-ODE sampling, adapted to the causal AR setting:
+    the clean target is the token-embedding sequence (what _dblock_step denoises),
+    conditioning is the causal context. --euler_start_sigma tunes how much of the
+    context is preserved (SDEdit-style): high => more generative, low => stronger
+    conditioning on the given context. Returns LayerNorm'd hidden [B,T,d]."""
+    dblock_blocks = int(getattr(args, "dblock_blocks", 4) or 4)
+    steps = max(dblock_blocks, int(getattr(args, "euler_steps", 0) or (dblock_blocks * 2)))
+    bsig = _block_sigmas(dblock_blocks)
+    groups = _dblock_block_layers(core, dblock_blocks)
+    sigma_min = float(bsig[0])
+    start = float(getattr(args, "euler_start_sigma", 0.0) or 0.0)
+    if start <= 0.0:
+        start = float(bsig[-1])  # default: full sigma_max (most faithful)
+    start = max(start, sigma_min * 2)
+    mask = causal_mask(ids.size(1), structured=use_structured_masks(args))
+    e = core.emb(ids)
+    # descending EDM/dblock sigma schedule from `start` down to sigma_min
+    import numpy as _np
+    lo, hi = math.log(sigma_min), math.log(start)
+    sched = [float(_np.exp(hi + (lo - hi) * (i / steps))) for i in range(steps + 1)]
+    z = e + sched[0] * torch.randn_like(e)
+    with amp(getattr(args, "amp", False)):
+        for i in range(steps):
+            s_cur, s_next = sched[i], sched[i + 1]
+            b = _dblock_select_block(s_cur, bsig)
+            sig_t = torch.full((ids.size(0),), s_cur, device=ids.device, dtype=z.dtype)
+            D = _edm_denoise_block(core, groups[b], z, sig_t, mask, args)
+            z = z + ((s_next - s_cur) / s_cur) * (z - D)
+        # final readout: denoise once at the lowest band (matches head training input)
+        sig0 = torch.full((ids.size(0),), sigma_min, device=ids.device, dtype=z.dtype)
+        D0 = _edm_denoise_block(core, groups[0], z, sig0, mask, args)
+        return core.ln(D0)
+
+
 @torch.no_grad()
 def infer(args):
     if args.mode == "ar":
@@ -3864,15 +3936,20 @@ def infer(args):
         print(f"{Colors.INFO}Generating ({mode_str})...{Colors.RESET}")
     start = time.time()
     if args.mode == "ar":
-        h, kvs = core(ids, causal_mask(ids.size(1), structured=use_structured_masks(args)), use_cache=True, total_seq_len=ids.size(1))
+        _euler = getattr(args, "sampler", "ar") == "euler"
+        if not _euler:
+            h, kvs = core(ids, causal_mask(ids.size(1), structured=use_structured_masks(args)), use_cache=True, total_seq_len=ids.size(1))
         for _ in range(args.max_new):
+            if _euler:
+                h = _dblock_euler_hidden(core, ids, args)
             logits = ar_h(h)[:, -1]
             logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
             nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
             ids = torch.cat([ids, nxt], 1)
             if EOS is not None and int(nxt.item()) == int(EOS):
                 break
-            h, kvs = core(ids[:, -1:], None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
+            if not _euler:
+                h, kvs = core(ids[:, -1:], None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
     elif args.mode == "nat":
         # Iterative mask-predict decode (CMLM): keep the prompt fixed and fill the
         # BLANK slots, committing confident predictions each pass. Unlike the
@@ -4167,6 +4244,12 @@ def main():
     tr.add_argument("--after_sft_lr_head", type=float, default=0.0)
     inf = sub.add_parser("infer")
     inf.add_argument("--mode", choices=["ar", "sat", "nat"], required=True)
+    inf.add_argument("--sampler", choices=["ar", "euler"], default="ar",
+                     help="ar=standard KV-cached decode; euler=DiffusionBlocks EDM Euler block-chain sampler.")
+    inf.add_argument("--euler_steps", type=int, default=0, help="Euler ODE steps (0=2x dblock_blocks).")
+    inf.add_argument("--euler_start_sigma", type=float, default=0.0,
+                     help="Starting noise for the Euler chain (0=sigma_max, most faithful; lower=stronger context conditioning).")
+    inf.add_argument("--dblock_blocks", type=int, default=4, help="Number of DiffusionBlocks the layer stack is partitioned into.")
     inf.add_argument("--ckpt", required=True)
     inf.add_argument("--prompt", required=True)
     inf.add_argument("--max_new", type=int, default=120)
