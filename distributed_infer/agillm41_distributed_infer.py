@@ -381,6 +381,7 @@ def cmd_worker(args: argparse.Namespace) -> None:
     stage = StageModule(runtime, sd, args.start_layer, args.end_layer, args.device, args.attn_backend)
     del sd
     gc.collect()
+    ThreadingHTTPServer.allow_reuse_address = True  # avoid TIME_WAIT bind failures on relaunch
     httpd = ThreadingHTTPServer((args.host, args.port), WorkerHandler)
     httpd.stage = stage  # type: ignore[attr-defined]
     httpd.token = args.token  # type: ignore[attr-defined]

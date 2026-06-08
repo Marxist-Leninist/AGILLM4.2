@@ -2219,7 +2219,7 @@ class TuneableAttentionMHA(nn.Module):
         if self.attn_backend != "sublinear" and _is_structured_attention_mask(attn_mask):
             attn_mask = attn_mask.to_dense(device=q.device, dtype=q.dtype)
         if self.attn_backend != "sublinear" and self.use_relpos and rel_bias_tokens is not None:
-            rel = alibi_bias(self.h, rel_bias_tokens)[:, :, -q.size(2):, :]
+            rel = alibi_bias(self.h, rel_bias_tokens)[:, :, -q.size(2):, :].to(device=q.device, dtype=q.dtype)
             attn_mask = rel if attn_mask is None else attn_mask + rel
         if self.attn_backend == "sdpa":
             try:
