@@ -69,9 +69,20 @@ cycle_once() {
     _wn="${_spec%%:*}"
     read _cb _cblk < <(python3 /workspace/agillm41_lease_decide.py "$_wn" 2>/dev/null)
     [ -z "$_cb" ] && _cb=1; [ -z "$_cblk" ] && _cblk=128
+    # weak 3GB nodes: train a rotating 2-layer window of their block (DiffusionBlocks
+    # layer-sharing) so they cycle through layers over time instead of OOMing on 7.
+    _mlflag=""
+    case "$_wn" in
+      prime|communist-web)
+        _rf="$ROUND_ROOT/.layer_rotor_$_wn"
+        _off=$(cat "$_rf" 2>/dev/null || echo 0); case "$_off" in ''|*[!0-9]*) _off=0;; esac
+        _mlflag="--max-layers 2 --layer-offset $_off"
+        echo $((_off + 2)) > "$_rf"
+        ;;
+    esac
     python agillm4/training_bench/agillm4_export_bench_packages.py \
       --ckpt "$ckpt" --out-dir "$out_dir" --workers "$_spec" \
-      --steps 1 --batch-size "$_cb" --block-size "$_cblk" \
+      --steps 1 --batch-size "$_cb" --block-size "$_cblk" $_mlflag \
       --runtime agillm41.py --source __default__ --attn-backend sublinear \
       --sublinear-window 128 --sublinear-stride 128 --sublinear-max-anchors 128 --sublinear-chunk 128 \
       --sublinear-sinks 4 --sublinear-recent-anchors 64 \
@@ -87,11 +98,18 @@ cycle_once() {
   # adaptive: size the V100 (opportunistic) lease from its REAL measured tok/s + VRAM
   read _b _blk < <(python3 /workspace/agillm41_lease_decide.py vast-v100 2>/dev/null)
   [ -z "$_b" ] && _b=6; [ -z "$_blk" ] && _blk=1300
+  # rotate the GPU lease across all DiffusionBlocks (0..3) over cycles so the
+  # fast GPU trains every block over time (block-wise training, not frozen).
+  _gblk_id=$(cat "$ROUND_ROOT/.gpu_block_rotor" 2>/dev/null || echo 0); case "$_gblk_id" in ''|*[!0-9]*) _gblk_id=0;; esac; _gblk_id=$((_gblk_id % 4)); echo $(((_gblk_id + 1) % 4)) > "$ROUND_ROOT/.gpu_block_rotor"
   _gbase="${base}_gpu"; _gdir="$ROUND_ROOT/$_gbase"; mkdir -p "$_gdir"
-  if python agillm4/training_bench/agillm4_export_bench_packages.py --ckpt "$ckpt" --out-dir "$_gdir" --workers "laptop-auto:0" --steps 1 --batch-size "$_b" --block-size "$_blk" --runtime agillm41.py --source __default__ --attn-backend sublinear --sublinear-window 128 --sublinear-stride 128 --sublinear-max-anchors 128 --sublinear-chunk 128 --sublinear-sinks 4 --sublinear-recent-anchors 64 --objective-mode stochastic --ar-prob 0.70 --sat-prob 0.15 --nat-prob 0.15 --ar-loss-tokens 256 --sat-loss-tokens 0 --nat-loss-tokens 256 --nat-mask-ratio 0.5 --nat-max-tokens "$_blk"; then
+  # CF-cacheable layer window: export only 3 of each block's 7 layers (~393MB < CF
+  # Free 512MB cache limit) and rotate the 3-wide window by 3 each round so all
+  # layers get trained over ~3 rounds (DiffusionBlocks: layers train separately over time).
+  _gloff=$(cat "$ROUND_ROOT/.gpu_layer_rotor" 2>/dev/null || echo 0); case "$_gloff" in ''|*[!0-9]*) _gloff=0;; esac; _gloff=$((_gloff % 7)); echo $(((_gloff + 3) % 7)) > "$ROUND_ROOT/.gpu_layer_rotor"
+  if python agillm4/training_bench/agillm4_export_bench_packages.py --ckpt "$ckpt" --out-dir "$_gdir" --workers "gpu0:0,gpu1:1,gpu2:2,gpu3:3" --steps 1 --batch-size "$_b" --block-size "$_blk" --max-layers 3 --layer-offset "$_gloff" --runtime agillm41.py --source __default__ --attn-backend sublinear --sublinear-window 128 --sublinear-stride 128 --sublinear-max-anchors 128 --sublinear-chunk 128 --sublinear-sinks 4 --sublinear-recent-anchors 64 --objective-mode stochastic --ar-prob 0.70 --sat-prob 0.15 --nat-prob 0.15 --ar-loss-tokens 256 --sat-loss-tokens 0 --nat-loss-tokens 256 --nat-mask-ratio 0.5 --nat-max-tokens "$_blk"; then
     copy_to_geth "$_gdir" "$_gbase"
     ssh -i "$GETH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no "$GETH_HOST" "cd '$GETH_WORKER_ROOT' && /root/agillm3_geth_cpu/venv/bin/python code/agillm4_publish_opportunistic_lease.py --export-dir '$GETH_WORKER_ROOT/packages/$_gbase' --root '$OPPORTUNISTIC_ROOT' --worker-id laptop-auto --source-worker laptop-auto"
-    printf '{"event":"gpu_lease_published","worker":"vast-v100","batch":%s,"block":%s}\n' "$_b" "$_blk"
+    printf '{"event":"gpu_lease_published","worker":"gpu-tier","dblocks":"0,1,2,3","batch":%s,"block":%s}\n' "$_b" "$_blk"
   else
     ssh -i "$GETH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=no "$GETH_HOST" "cd '$GETH_WORKER_ROOT' && /root/agillm3_geth_cpu/venv/bin/python code/agillm4_publish_opportunistic_lease.py --export-dir '$GETH_WORKER_ROOT/packages/$base' --root '$OPPORTUNISTIC_ROOT' --worker-id laptop-auto --source-worker laptop-auto"
   fi

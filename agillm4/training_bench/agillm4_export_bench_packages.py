@@ -134,7 +134,10 @@ def main() -> int:
         "tie_weights": tie_weights,
         "tokenizer_id": ck.get("tokenizer_id"),
         "vocab": vocab,
-        "emb_weight": core["emb.weight"].detach().cpu(),
+        # AGILLM_FP16_FROZEN: fp16 the frozen embedding (662MB->331MB): halves the
+        # repeated per-round volunteer download and drops it under CF Free 512MB cache.
+        # Frozen (not trained); worker copy_ casts back to fp32, amp uses bf16 anyway.
+        "emb_weight": core["emb.weight"].detach().cpu().to(torch.float16),
         "ln_weight": core["ln.weight"].detach().cpu(),
         "ln_bias": core["ln.bias"].detach().cpu(),
     }

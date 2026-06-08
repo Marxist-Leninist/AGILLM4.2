@@ -218,6 +218,12 @@ class LeaseStore:
         return self.public_lease(lease, token)
 
     _PKG_ROOT = "/root/agillm41_worker/packages"
+    # Cloudflare-fronted, cached download origin for package/frozen GETs. Packages are
+    # sliced (<=3 layers ~393MB) + fp16 frozen (~331MB) so they fit under CF Free's
+    # 512MB cache limit. API + large result-upload stay on join. (unproxied) since
+    # submits exceed CF's 100MB upload body limit. Override with AGILLM_DL_BASE.
+    import os as _os
+    _DL_BASE = (_os.environ.get("AGILLM_DL_BASE", "https://dl.opentransformers.online")).rstrip("/")
 
     def _pkg_static_url(self, fp: str):
         try:
@@ -227,7 +233,8 @@ class LeaseStore:
             rp = os.path.relpath(fp, self._PKG_ROOT)
             if rp.startswith("..") or os.path.isabs(rp):
                 return None
-            return self.public_base_url + "/pkg/" + rp
+            base = self._DL_BASE or self.public_base_url
+            return base + "/pkg/" + rp
         except Exception:
             return None
 
