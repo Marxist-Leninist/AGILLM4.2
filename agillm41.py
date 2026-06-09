@@ -1443,7 +1443,14 @@ if SYNTHETIC_TOKENIZER:
     tok = _SyntheticTokenizer(int(os.environ.get("AGILLM_SYNTHETIC_VOCAB", "8192")))
     print(f"[tokenizer] synthetic tokenizer enabled vocab={tok.vocab_size}")
 else:
-    tok = AutoTokenizer.from_pretrained(TOKENIZER_ID, use_fast=True, trust_remote_code=True)
+    _tok_src = os.environ.get("TOKENIZER_DIR", "/workspace/tokenizers/deepseek-v4-pro")
+    if not os.path.isdir(_tok_src):
+        _tok_src = TOKENIZER_ID
+    try:
+        tok = AutoTokenizer.from_pretrained(_tok_src, use_fast=True, trust_remote_code=True, local_files_only=True)
+    except Exception as _tok_exc:
+        print(f"[tokenizer] offline load from {_tok_src} failed ({_tok_exc}); network fallback {TOKENIZER_ID}", flush=True)
+        tok = AutoTokenizer.from_pretrained(TOKENIZER_ID, use_fast=True, trust_remote_code=True)
     if tok.pad_token is None:
         tok.add_special_tokens({"pad_token": "<|pad|>"})
 
@@ -1968,6 +1975,7 @@ class TuneableAttentionMHA(nn.Module):
         sublinear_sinks: int = DEFAULT_SUBLINEAR_SINKS,
         sublinear_recent_anchors: int = DEFAULT_SUBLINEAR_RECENT_ANCHORS,
         sublinear_pooled_landmarks: bool = DEFAULT_SUBLINEAR_POOLED_LANDMARKS,
+        tie_kv: bool = False,
     ):
         super().__init__()
         assert d % h == 0
@@ -1987,7 +1995,11 @@ class TuneableAttentionMHA(nn.Module):
         # Exact n1 harvest: one fused QKV projection is mathematically the same
         # as three independent bias-free Linear(d, d) projections with their
         # weights stacked along out_features.
-        self.qkv = nn.Linear(d, 3 * d, bias=False)
+        # Q-K=V (arXiv 2606.04032): tie Key & Value into one shared projection.
+        # For r>dk, reshape_heads==reshape_v so k_new IS v_new (exact) -> clean 50% KV-cache cut
+        # and -33% qkv params. Gated; default off preserves the 3*d checkpoint layout.
+        self.tie_kv = bool(tie_kv)
+        self.qkv = nn.Linear(d, (2 if self.tie_kv else 3) * d, bias=False)
         self.U = nn.Parameter(torch.randn(self.dk, r))
         nn.init.orthogonal_(self.U)
         self.proj = nn.Linear(h * self.dk, d, bias=False)
@@ -2192,14 +2204,19 @@ class TuneableAttentionMHA(nn.Module):
         return torch.cat(outputs, dim=2)
 
     def forward(self, x, mask=None, rel_bias_tokens=None, kv_cache=None, use_cache=False):
-        q_lin, k_lin, v_lin = self.qkv(x).chunk(3, dim=-1)
-        v_new = self._reshape_v(v_lin)
+        if self.tie_kv:
+            q_lin, kv_lin = self.qkv(x).chunk(2, dim=-1)
+            k_lin = v_lin = kv_lin
+        else:
+            q_lin, k_lin, v_lin = self.qkv(x).chunk(3, dim=-1)
         if self.r > self.dk:
             q = self._reshape_heads(q_lin) @ self._get_metric()
             k_new = self._reshape_heads(k_lin)
+            v_new = k_new if self.tie_kv else self._reshape_v(v_lin)
         else:
             q = self._proj_qk(q_lin)
             k_new = self._proj_qk(k_lin)
+            v_new = self._reshape_v(v_lin)
         if kv_cache is None:
             k, v = k_new, v_new
         elif isinstance(kv_cache, KVBuffer):
@@ -2344,6 +2361,7 @@ class Block(nn.Module):
         moe_experts: int = DEFAULT_MOE_EXPERTS,
         moe_top_k: int = DEFAULT_MOE_TOP_K,
         moe_mlp_mult: int = DEFAULT_MOE_MLP_MULT,
+        tie_kv: bool = False,
     ):
         super().__init__()
         self.ln1, self.ln2 = nn.LayerNorm(d), nn.LayerNorm(d)
@@ -2359,6 +2377,7 @@ class Block(nn.Module):
             sublinear_sinks=sublinear_sinks,
             sublinear_recent_anchors=sublinear_recent_anchors,
             sublinear_pooled_landmarks=sublinear_pooled_landmarks,
+            tie_kv=tie_kv,
         )
         self.ff = (
             MoEFFN(d, mlp_mult=moe_mlp_mult, experts=moe_experts, top_k=moe_top_k)
@@ -2398,9 +2417,12 @@ class Encoder(nn.Module):
         moe_experts: Optional[int] = None,
         moe_top_k: Optional[int] = None,
         moe_mlp_mult: Optional[int] = None,
+        tie_kv: Optional[bool] = None,
     ):
         super().__init__()
         d, l, h, r = cfg["d"], cfg["layers"], cfg["heads"], cfg["rank"]
+        if tie_kv is None:
+            tie_kv = bool(cfg.get("tie_kv", False))
         if moe_ffn is None:
             moe_ffn = bool(cfg.get("moe_ffn", DEFAULT_MOE_FFN))
         if moe_experts is None:
@@ -2430,6 +2452,7 @@ class Encoder(nn.Module):
                 moe_experts=moe_experts,
                 moe_top_k=moe_top_k,
                 moe_mlp_mult=moe_mlp_mult,
+                tie_kv=bool(tie_kv),
             )
             for _ in range(l)
         ])
@@ -3557,6 +3580,8 @@ def train(args):
     if args.rank: cfg["rank"] = args.rank
     if args.x2 and not prev_cfg: cfg["layers"] *= 2
     prev_moe = prev_cfg if isinstance(prev_cfg, dict) else {}
+    if bool(getattr(args, "tie_kv", False)):
+        cfg["tie_kv"] = True
     requested_moe = bool(getattr(args, "moe_ffn", DEFAULT_MOE_FFN))
     if requested_moe or bool(prev_moe.get("moe_ffn", False)):
         cfg["moe_ffn"] = True
@@ -3735,9 +3760,7 @@ def _sample(logits, T, top_k, top_p, min_p, greedy):
     if probs.sum() == 0: return logits.argmax(-1, keepdim=True)
     return probs.div_(probs.sum()).multinomial(1)
 
-
 def _dblock_block_layers(core, dblock_blocks):
-    """Partition the core's layer stack into `dblock_blocks` contiguous blocks."""
     L = len(core.blocks)
     B = max(1, int(dblock_blocks))
     per = max(1, L // B)
@@ -3750,7 +3773,6 @@ def _dblock_block_layers(core, dblock_blocks):
 
 
 def _dblock_select_block(sigma, bsig):
-    """Index of the block whose band [bsig[b], bsig[b+1]] contains sigma (clamped)."""
     for b in range(len(bsig) - 1):
         if bsig[b] <= sigma <= bsig[b + 1]:
             return b
@@ -3758,10 +3780,6 @@ def _dblock_select_block(sigma, bsig):
 
 
 def _edm_denoise_block(core, layers, z, sigma_t, mask, args):
-    """EDM-preconditioned denoiser D_b(z) in embedding space, matching _dblock_step.
-
-    D = c_skip*z + c_out*F(c_in*z), where F runs only this block's layers. Returns
-    the clean-target estimate (pre-LayerNorm) so it can be used in the Euler ODE."""
     cs, co, ci = _edm_pre(sigma_t)
     h = ci * z
     for li in layers:
@@ -3771,13 +3789,10 @@ def _edm_denoise_block(core, layers, z, sigma_t, mask, args):
 
 @torch.no_grad()
 def _dblock_euler_hidden(core, ids, args):
-    """Final hidden representation via the DiffusionBlocks EDM Euler block-chain.
-
-    Faithful to the paper's reverse-ODE sampling, adapted to the causal AR setting:
-    the clean target is the token-embedding sequence (what _dblock_step denoises),
-    conditioning is the causal context. --euler_start_sigma tunes how much of the
-    context is preserved (SDEdit-style): high => more generative, low => stronger
-    conditioning on the given context. Returns LayerNorm'd hidden [B,T,d]."""
+    """DiffusionBlocks EDM Euler block-chain hidden state (faithful reverse ODE),
+    adapted to agillm4.1's causal AR head. --euler_start_sigma tunes context
+    conditioning (SDEdit-style); returns LayerNorm'd hidden [B,T,d]."""
+    import numpy as _np
     dblock_blocks = int(getattr(args, "dblock_blocks", 4) or 4)
     steps = max(dblock_blocks, int(getattr(args, "euler_steps", 0) or (dblock_blocks * 2)))
     bsig = _block_sigmas(dblock_blocks)
@@ -3785,12 +3800,10 @@ def _dblock_euler_hidden(core, ids, args):
     sigma_min = float(bsig[0])
     start = float(getattr(args, "euler_start_sigma", 0.0) or 0.0)
     if start <= 0.0:
-        start = float(bsig[-1])  # default: full sigma_max (most faithful)
+        start = float(bsig[-1])
     start = max(start, sigma_min * 2)
     mask = causal_mask(ids.size(1), structured=use_structured_masks(args))
     e = core.emb(ids)
-    # descending EDM/dblock sigma schedule from `start` down to sigma_min
-    import numpy as _np
     lo, hi = math.log(sigma_min), math.log(start)
     sched = [float(_np.exp(hi + (lo - hi) * (i / steps))) for i in range(steps + 1)]
     z = e + sched[0] * torch.randn_like(e)
@@ -3801,7 +3814,6 @@ def _dblock_euler_hidden(core, ids, args):
             sig_t = torch.full((ids.size(0),), s_cur, device=ids.device, dtype=z.dtype)
             D = _edm_denoise_block(core, groups[b], z, sig_t, mask, args)
             z = z + ((s_next - s_cur) / s_cur) * (z - D)
-        # final readout: denoise once at the lowest band (matches head training input)
         sig0 = torch.full((ids.size(0),), sigma_min, device=ids.device, dtype=z.dtype)
         D0 = _edm_denoise_block(core, groups[0], z, sig0, mask, args)
         return core.ln(D0)
@@ -4170,6 +4182,8 @@ def main():
                     help="Optional cap for NAT target tokens per batch; 0 uses the whole block.")
     tr.add_argument("--nat_mask_ratio", type=float, default=0.5,
                     help="Fraction of positions masked to BLANK for the NAT mask-predict (CMLM) objective.")
+    tr.add_argument("--tie_kv", action=argparse.BooleanOptionalAction, default=False,
+                    help="Q-K=V: tie Key & Value into one projection (~50%% KV cache, -33%% qkv params). Trained-in only; not loadable into a 3-proj checkpoint.")
     tr.add_argument("--moe_ffn", action=argparse.BooleanOptionalAction, default=DEFAULT_MOE_FFN,
                     help="Use Mixture-of-Experts feed-forward layers inside the transformer blocks.")
     tr.add_argument("--moe_experts", type=int, default=DEFAULT_MOE_EXPERTS,
@@ -4244,12 +4258,10 @@ def main():
     tr.add_argument("--after_sft_lr_head", type=float, default=0.0)
     inf = sub.add_parser("infer")
     inf.add_argument("--mode", choices=["ar", "sat", "nat"], required=True)
-    inf.add_argument("--sampler", choices=["ar", "euler"], default="ar",
-                     help="ar=standard KV-cached decode; euler=DiffusionBlocks EDM Euler block-chain sampler.")
+    inf.add_argument("--sampler", choices=["ar", "euler"], default="ar", help="ar=KV decode; euler=DiffusionBlocks EDM Euler sampler.")
     inf.add_argument("--euler_steps", type=int, default=0, help="Euler ODE steps (0=2x dblock_blocks).")
-    inf.add_argument("--euler_start_sigma", type=float, default=0.0,
-                     help="Starting noise for the Euler chain (0=sigma_max, most faithful; lower=stronger context conditioning).")
-    inf.add_argument("--dblock_blocks", type=int, default=4, help="Number of DiffusionBlocks the layer stack is partitioned into.")
+    inf.add_argument("--euler_start_sigma", type=float, default=0.0, help="Euler start noise (0=sigma_max; lower=stronger context conditioning).")
+    inf.add_argument("--dblock_blocks", type=int, default=4, help="Number of DiffusionBlocks for the Euler sampler.")
     inf.add_argument("--ckpt", required=True)
     inf.add_argument("--prompt", required=True)
     inf.add_argument("--max_new", type=int, default=120)
