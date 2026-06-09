@@ -16,7 +16,32 @@ SIDE_DIR=/workspace/agillm41_side_updates
 mkdir -p "$SAVE_DIR" "$SIDE_DIR/incoming" "$SIDE_DIR/accepted" "$SIDE_DIR/rejected"
 exec >> /workspace/agillm41_master_train.log 2>&1
 echo "LAUNCH_AGILLM42_MASTER (tie_kv, fresh) $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-exec python -u agillm41.py train --preset agillm4_floor --tie_kv --resume_delta /workspace/agillm4_4090_ckpts/agillm42_tiekv_seed.delta.pt \
+SEED_DELTA="$SAVE_DIR/agillm42_tiekv_seed.delta.pt"
+# Resume from the newest full checkpoint so a watchdog restart continues the run
+# (preserving recovery + optimizer state) instead of re-seeding from the warm-start
+# delta. Fall back to the tie_kv seed only on a fresh box with no checkpoint yet.
+RESUME_CKPT="$(python3 - "$SAVE_DIR" <<'PY'
+import json, os, sys, glob
+d = sys.argv[1]
+p = ""
+try:
+    p = json.load(open(os.path.join(d, "latest.json"))).get("path", "")
+except Exception:
+    p = ""
+if not p or not os.path.exists(p):
+    c = sorted(glob.glob(os.path.join(d, "pretrain_step*.pt")), key=os.path.getmtime)
+    p = c[-1] if c else ""
+print(p)
+PY
+)"
+if [ -n "$RESUME_CKPT" ] && [ -f "$RESUME_CKPT" ]; then
+  RESUME_ARG="--resume $RESUME_CKPT"
+  echo "RESUME from latest full ckpt: $RESUME_CKPT"
+else
+  RESUME_ARG="--resume_delta $SEED_DELTA"
+  echo "RESUME from tie_kv seed delta (no full ckpt found): $SEED_DELTA"
+fi
+exec python -u agillm41.py train --preset agillm4_floor --tie_kv $RESUME_ARG \
   --dblock --dblock_blocks 4 --dblock_schedule loss_balanced --dblock_warmup_steps 16 \
   --dblock_sigma_curriculum_steps 2000 --dblock_log_every 25 --dblock_objective_mode stochastic \
   --dblock_ar_prob 0.70 --dblock_sat_prob 0.15 --dblock_nat_prob 0.15 \
