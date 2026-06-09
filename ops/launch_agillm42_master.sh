@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# AGILLM-4.2: fresh run, same arch (Transformer + MoE + DiffusionBlocks + sublinear)
-# trained-in with Q-K=V tied KV (--tie_kv). Reuses the agillm4.1 distributed stack
-# (same save dir + side_updates) so the side-cycle/dispatch/public-join keep working.
+# AGILLM-4.2: same arch (Transformer + MoE + DiffusionBlocks + sublinear), tie_kv.
+# Reuses the agillm4.1 distributed stack (same save dir + side_updates).
 set -Eeuo pipefail
 cd /workspace/agillm41-mainline
 export TOKENIZERS_PARALLELISM=false
@@ -15,38 +14,49 @@ SAVE_DIR=/workspace/agillm4_4090_ckpts
 SIDE_DIR=/workspace/agillm41_side_updates
 mkdir -p "$SAVE_DIR" "$SIDE_DIR/incoming" "$SIDE_DIR/accepted" "$SIDE_DIR/rejected"
 exec >> /workspace/agillm41_master_train.log 2>&1
-echo "LAUNCH_AGILLM42_MASTER (tie_kv, fresh) $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "LAUNCH_AGILLM42_MASTER (tie_kv) $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 SEED_DELTA="$SAVE_DIR/agillm42_tiekv_seed.delta.pt"
-# Resume from the newest full checkpoint so a watchdog restart continues the run
-# (preserving recovery + optimizer state) instead of re-seeding from the warm-start
-# delta. Fall back to the tie_kv seed only on a fresh box with no checkpoint yet.
-RESUME_CKPT="$(python3 - "$SAVE_DIR" <<'PY'
-import json, os, sys, glob
-d = sys.argv[1]
-p = ""
+RESUME_DELTA="$SAVE_DIR/agillm42_resume.delta.pt"
+# Resume from the newest FULL checkpoint, but as a weights-only delta: this resets
+# the (8-bit, paged) optimizer and preserves step/seen_tok, which fits in VRAM at B=6.
+# A plain --resume reloads full optimizer state and OOMs the 4090.
+CONV=0
+python3 - "$SAVE_DIR" "$RESUME_DELTA" <<'PY' || CONV=$?
+import json, os, sys, glob, torch
+d, out = sys.argv[1], sys.argv[2]
+src = ""
 try:
-    p = json.load(open(os.path.join(d, "latest.json"))).get("path", "")
+    src = json.load(open(os.path.join(d, "latest.json"))).get("path", "")
 except Exception:
-    p = ""
-if not p or not os.path.exists(p):
+    src = ""
+if not src or not os.path.exists(src):
     c = sorted(glob.glob(os.path.join(d, "pretrain_step*.pt")), key=os.path.getmtime)
-    p = c[-1] if c else ""
-print(p)
+    src = c[-1] if c else ""
+if not src:
+    sys.exit(3)
+ck = torch.load(src, map_location="cpu", weights_only=False)
+delta = {"delta": True,
+         "weights": {k: ck[k] for k in ("core", "ar", "sat", "nat") if k in ck},
+         "step": ck.get("step", 0), "seen_tok": ck.get("seen_tok", 0),
+         "cfg": ck.get("cfg")}
+tmp = out + ".tmp"
+torch.save(delta, tmp); os.replace(tmp, out)
+print("converted %s -> resume delta step %s" % (os.path.basename(src), delta["step"]))
 PY
-)"
-if [ -n "$RESUME_CKPT" ] && [ -f "$RESUME_CKPT" ]; then
-  RESUME_ARG="--resume $RESUME_CKPT"
-  echo "RESUME from latest full ckpt: $RESUME_CKPT"
+if [ "$CONV" -eq 0 ] && [ -f "$RESUME_DELTA" ]; then
+  rm -f "$RESUME_DELTA.sha256"
+  RESUME_ARG="--resume_delta $RESUME_DELTA"
+  echo "RESUME from converted recovery delta: $RESUME_DELTA"
 else
   RESUME_ARG="--resume_delta $SEED_DELTA"
-  echo "RESUME from tie_kv seed delta (no full ckpt found): $SEED_DELTA"
+  echo "RESUME conversion failed (rc=$CONV); falling back to seed delta: $SEED_DELTA"
 fi
 exec python -u agillm41.py train --preset agillm4_floor --tie_kv $RESUME_ARG \
   --dblock --dblock_blocks 4 --dblock_schedule loss_balanced --dblock_warmup_steps 16 \
   --dblock_sigma_curriculum_steps 2000 --dblock_log_every 25 --dblock_objective_mode stochastic \
   --dblock_ar_prob 0.70 --dblock_sat_prob 0.15 --dblock_nat_prob 0.15 \
   --dblock_ar_loss_tokens 512 --dblock_sat_loss_tokens 0 --dblock_nat_loss_tokens 512 \
-  --moe_ffn --moe_experts 2 --moe_top_k 1 --moe_mlp_mult 4 --moe_aux_coef 0.01 --moe_z_coef 0.001 \
+  --moe_ffn --moe_experts 2 --moe_top_k 1 --moe_mlp_mult 4 \
   --tie_weights --batch_size 6 --block 1024 --amp --attn_backend sublinear \
   --sublinear_window 128 --sublinear_stride 128 --sublinear_max_anchors 128 --sublinear_chunk 128 \
   --sublinear_sinks 4 --sublinear_recent_anchors 64 --no-sublinear_pooled_landmarks \
