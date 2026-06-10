@@ -4183,6 +4183,13 @@ def _apply_penalties(logits, ids, n, rep_p, pres_p, freq_p):
         logits[..., uniq] = torch.where(sel > 0, sel / rep_p, sel * rep_p)
     return logits
 
+def _suppress_eos(logits, args):
+    if getattr(args, "ignore_eos", False) and EOS is not None:
+        logits = logits.clone()
+        logits[..., int(EOS)] = -1e9
+    return logits
+
+
 def _sample(logits, T, top_k, top_p, min_p, greedy):
     if greedy: return logits.argmax(-1, keepdim=True)
     probs = (logits / max(T, 1e-8)).softmax(-1)
@@ -4392,9 +4399,10 @@ def infer(args):
                 h = _dblock_euler_hidden(core, ids, args)
             logits = ar_h(h)[:, -1]
             logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
+            logits = _suppress_eos(logits, args)
             nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
             ids = torch.cat([ids, nxt], 1)
-            if EOS is not None and int(nxt.item()) == int(EOS):
+            if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
                 break
             if not _euler:
                 h, kvs = core(ids[:, -1:], None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
@@ -4425,6 +4433,7 @@ def infer(args):
                 args.presence_penalty,
                 args.frequency_penalty,
             )
+            logits_pos = _suppress_eos(logits_pos, args)
             return _sample(logits_pos, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
 
         for p in range(passes):
@@ -4458,10 +4467,11 @@ def infer(args):
         while ids.size(1) % SAT_BLOCK != 0 and added < args.max_new:
             logits = ar_h(h)[:, -1]
             logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
+            logits = _suppress_eos(logits, args)
             nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
             ids = torch.cat([ids, nxt], 1)
             added += 1
-            if EOS is not None and int(nxt.item()) == int(EOS):
+            if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
                 stop = True
                 break
             h, kvs = core(nxt, None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
@@ -4474,13 +4484,19 @@ def infer(args):
             stride = min(int(stride), logits_all.size(1))
             new_tokens = []
             for i in range(int(stride)):
-                logits = logits_all[:, i]
+                logits = logits_all[:, i].clone()
+                # BLANK is the SAT/NAT mask-filler token; with this tokenizer it is
+                # ALSO the EOS id (pad==eos==1), so an unbanned SAT head "ends" on
+                # every filler prediction while NAT (which bans BLANK) keeps going.
+                # Ban it here exactly like the NAT path does.
+                logits[..., BLANK] = -1e9
                 logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
+                logits = _suppress_eos(logits, args)
                 nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
                 new_tokens.append(nxt)
                 ids = torch.cat([ids, nxt], 1)
                 added += 1
-                if EOS is not None and int(nxt.item()) == int(EOS):
+                if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
                     stop = True
                     break
                 if added >= args.max_new: break
@@ -4727,15 +4743,15 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta):
         "--dblock", "--dblock_blocks", "4", "--dblock_schedule", "loss_balanced",
         "--dblock_warmup_steps", "16", "--dblock_sigma_curriculum_steps", "2000",
         "--dblock_log_every", "25", "--dblock_objective_mode", "stochastic",
-        "--dblock_ar_prob", "0.60", "--dblock_sat_prob", "0.25", "--dblock_nat_prob", "0.15",
-        "--dblock_ar_loss_tokens", "512", "--dblock_sat_loss_tokens", "0", "--dblock_nat_loss_tokens", "512",
+        "--dblock_ar_prob", "0.45", "--dblock_sat_prob", "0.40", "--dblock_nat_prob", "0.15",
+        "--dblock_ar_loss_tokens", "512", "--dblock_sat_loss_tokens", "1024", "--dblock_nat_loss_tokens", "512",
         "--moe_ffn", "--moe_experts", "2", "--moe_top_k", "1", "--moe_mlp_mult", "4",
         "--moe_shared_experts", "1", "--moe_shared_mlp_mult", "2", "--moe_aux_coef", "0.01", "--moe_z_coef", "0.001",
         "--tie_weights", "--batch_size", "6", "--block", "1024", "--amp", "--attn_backend", "sublinear",
         "--sublinear_window", "128", "--sublinear_stride", "128", "--sublinear_max_anchors", "128", "--sublinear_chunk", "128",
         "--sublinear_sinks", "4", "--sublinear_recent_anchors", "64", "--no-sublinear_pooled_landmarks",
         "--grad_checkpoint", "--dblock_checkpoint_stride", "1", "--optimizer", "paged_adamw8bit",
-        "--loss_spike_skip", "3.0", "--sat_every", "4", "--nat_every", "4",
+        "--loss_spike_skip", "3.0", "--sat_every", "1", "--nat_every", "4",
         "--nat_max_tokens", "768", "--nat_mask_ratio", "0.5", "--token_param_ratio", "55",
         "--val_tokens", "32768", "--val_every_sec", "3600", "--data_seed", "-1",
         "--save_dir", str(save_dir), "--save_every_sec", "3600", "--heartbeat_every_sec", "300",
@@ -5127,6 +5143,8 @@ def main():
     inf.add_argument("--no_structured_masks", action="store_true")
     inf.add_argument("--nat_expand", type=int, default=2)
     inf.add_argument("--nat_passes", type=int, default=1)
+    inf.add_argument("--ignore_eos", action="store_true",
+                     help="Never stop on (or sample) EOS: suppress its logit and emit exactly max_new tokens. For base-model / SAT-head testing.")
     sup = sub.add_parser("supervise", help="Native AGILLM4.3 trainer supervisor")
     sup.add_argument("--save_dir", default="/workspace/agillm4_4090_ckpts")
     sup.add_argument("--side_dir", default="/workspace/agillm41_side_updates")
