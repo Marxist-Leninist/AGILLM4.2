@@ -114,10 +114,14 @@ def block_kwargs(runtime: Any, cfg: dict[str, Any], rargs: dict[str, Any]) -> di
         "moe_top_k": int(cfg.get("moe_top_k", getattr(runtime, "DEFAULT_MOE_TOP_K", 1))),
         "moe_mlp_mult": int(cfg.get("moe_mlp_mult", getattr(runtime, "DEFAULT_MOE_MLP_MULT", 4))),
     }
-    # Shared experts (AGILLM 4.3+): forward only when the runtime's Block accepts
+    # Forward optional AGILLM 4.3+ block settings only when the runtime accepts
     # them, so packages built from older runtime files keep working unchanged.
     import inspect
-    if "moe_shared_experts" in inspect.signature(runtime.Block.__init__).parameters:
+    block_params = inspect.signature(runtime.Block.__init__).parameters
+    has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in block_params.values())
+    if bool(cfg.get("tie_kv", False)) and ("tie_kv" in block_params or has_var_kwargs):
+        kw["tie_kv"] = True
+    if "moe_shared_experts" in block_params or has_var_kwargs:
         kw["moe_shared_experts"] = int(cfg.get("moe_shared_experts", 0))
         kw["moe_shared_mlp_mult"] = int(cfg.get("moe_shared_mlp_mult", 0))
     return kw
@@ -155,8 +159,8 @@ def global_block_state(local_state: dict[str, Any], layers: list[int]) -> dict[s
 
 def make_args(rargs: dict[str, Any]) -> SimpleNamespace:
     values = {
-        "amp": True,
-        "grad_checkpoint": True,
+        "amp": False,
+        "grad_checkpoint": False,
         "no_structured_masks": False,
         "dblock_blocks": 1,
         "dblock_schedule": "roundrobin",
@@ -181,7 +185,7 @@ def make_args(rargs: dict[str, Any]) -> SimpleNamespace:
         "dblock_sat_prob": 0.15,
         "dblock_nat_prob": 0.15,
         "dblock_log_every": 1,
-        "dblock_checkpoint_stride": 1,
+        "dblock_checkpoint_stride": 0,
         "dblock_checkpoint_skip_tail": 0,
         "dblock_activation_offload": False,
         "dblock_activation_offload_min_mb": 1.0,
