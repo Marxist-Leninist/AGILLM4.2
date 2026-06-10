@@ -2931,6 +2931,110 @@ def _prune_deltas(save_dir: pathlib.Path, phase_name: str, max_deltas: int):
         return
     _prune_delta_files_to_count(save_dir, phase_name, max_deltas)
 
+
+def _pinned_basenames(save_dir: pathlib.Path) -> set:
+    try:
+        txt = (save_dir / ".pinned").read_text()
+        return {ln.strip().split("/")[-1] for ln in txt.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")}
+    except Exception:
+        return set()
+
+
+def _disk_hygiene(save_dir, phase_name: str, args, reason: str = ""):
+    """In-file disk auto-prune so the training disk never wedges (a full disk makes
+    Python unable to even start -> watchdog crash-loop). All AGILLM-4.2 disk pruning
+    lives here in the single file rather than an external janitor that can silently die.
+
+    Conservative: removes orphan *.tmp partial writes, full checkpoints beyond
+    --max_ckpts, deltas beyond --delta_max_keep, stale side-cycle rounds and applied
+    async-update artifacts, and escalates under --disk_free_floor_gb. NEVER deletes the
+    newest full checkpoint, the resume/seed deltas, files younger than 2 min, or anything
+    listed in <save_dir>/.pinned. Best-effort: never raises into the training loop."""
+    import shutil, glob as _glob
+    try:
+        save_dir = pathlib.Path(save_dir)
+        ws = save_dir.parent
+        pinned = _pinned_basenames(save_dir)
+        floor = float(getattr(args, "disk_free_floor_gb", 0.0) or 0.0)
+        now = time.time()
+
+        def free_gb():
+            try:
+                return shutil.disk_usage(str(save_dir)).free / (1024 ** 3)
+            except Exception:
+                return 1e9
+
+        def young(p, secs=120):
+            try:
+                return (now - p.stat().st_mtime) < secs
+            except Exception:
+                return True
+
+        def rm(p):
+            try:
+                if p.name in pinned:
+                    return False
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink()
+                print(f"  [disk] pruned {p.name}", flush=True)
+                return True
+            except Exception:
+                return False
+
+        def newest_first(paths):
+            return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
+
+        # 1) orphan partial writes (a live save's *.tmp is younger than 2 min)
+        for t in save_dir.glob("*.tmp"):
+            if not young(t):
+                rm(t)
+        # 2) full checkpoints beyond --max_ckpts (keep newest)
+        keep_full = max(1, int(getattr(args, "max_ckpts", 2) or 2))
+        fulls = newest_first(list(save_dir.glob(f"{phase_name}_step*.pt")))
+        for p in fulls[keep_full:]:
+            if not young(p):
+                rm(p)
+        # 3) deltas beyond --delta_max_keep
+        keep_delta = max(1, int(getattr(args, "delta_max_keep", 1) or 1))
+        deltas = newest_first(list(save_dir.glob(f"{phase_name}_delta_step*.pt")))
+        for p in deltas[keep_delta:]:
+            if not young(p):
+                rm(p)
+        # 4) transient side artifacts (side-cycle rounds, applied async updates)
+        rounds = ws / "agillm41_side_rounds"
+        rdirs = newest_first([d for d in rounds.glob("side_cycle_*") if d.is_dir()]) if rounds.exists() else []
+        for p in rdirs[2:]:
+            rm(p)
+        su = ws / "agillm41_side_updates"
+        inc = su / "incoming"
+        if inc.exists():
+            for p in newest_first(list(inc.glob("*.pt")))[4:]:
+                if not young(p):
+                    rm(p)
+        for sub in ("accepted", "rejected"):
+            d = su / sub
+            if d.exists():
+                for p in d.glob("*"):
+                    if not young(p, 600):
+                        rm(p)
+        # 5) escalate under the free-space floor (transient + extra ckpts only)
+        if floor > 0 and free_gb() < floor:
+            print(f"  [disk] below floor {floor:.0f}GB (free {free_gb():.1f}GB){(' ' + reason) if reason else ''}; escalating", flush=True)
+            for p in rdirs[1:]:
+                rm(p)
+            for p in newest_first(list(save_dir.glob(f"{phase_name}_delta_step*.pt")))[1:]:
+                if not young(p):
+                    rm(p)
+            for p in newest_first(list(save_dir.glob(f"{phase_name}_step*.pt")))[1:]:
+                if not young(p):
+                    rm(p)
+            print(f"  [disk] after escalation: {free_gb():.1f}GB free", flush=True)
+    except Exception as e:
+        print(f"[disk-hygiene] error: {e}", flush=True)
+
 def _load_module_state_compatible(module: nn.Module, state: dict, label: str = "module") -> int:
     """Load matching tensors only; skip obsolete untied vocab matrices for tied heads."""
     if not isinstance(state, dict):
@@ -3362,6 +3466,7 @@ def _train_phase(
     last_save_mono = time.monotonic() - (now_wall - (resume_wall_time or now_wall))
     last_delta_step = start_step
     last_heartbeat_mono = time.monotonic()
+    _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="startup")
     print(f"[{phase_name}] Starting. Goal: {total_tokens_needed:,} tokens. Batch={BATCH}, Block={BLOCK}")
     print(
         f"[{phase_name}] AR_ONLY={args.ar_only}, SAT_EVERY={args.sat_every}, "
@@ -3574,6 +3679,7 @@ def _train_phase(
                 pass
             _ck_name = f"{phase_name}_step{step:08d}.pt"
             _flush_delta()
+            _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-flush-save")
             _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
             save_ckpt(pathlib.Path(args.save_dir) / _ck_name, core, ar_h, sat_h, nat_h, opt, scaler,
                       meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights})
@@ -3586,6 +3692,7 @@ def _train_phase(
             if now_mono - last_save_mono >= args.save_every_sec:
                 ck_name = f"{phase_name}_step{step:08d}.pt"
                 _flush_delta()  # wait for any in-flight delta before full save
+                _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="pre-save")
                 _prune_checkpoints(pathlib.Path(args.save_dir), phase_name, max_ckpts)
                 save_ckpt(pathlib.Path(args.save_dir) / ck_name, core, ar_h, sat_h, nat_h, opt, scaler,
                           meta={"cfg": cfg, "step": step, "seen_tok": seen_tok, "wall_time": time.time(), "tie_weights": tie_weights})
@@ -4206,6 +4313,8 @@ def main():
     tr.add_argument("--optimizer", choices=["adamw", "adamw8bit", "paged_adamw8bit"], default="adamw",
                     help="Optimizer backend. 8-bit options reduce VRAM on 24GB production runs.")
     tr.add_argument("--save_every_sec", type=int, default=DEFAULT_SAVE_SEC)
+    tr.add_argument("--disk_free_floor_gb", type=float, default=12.0,
+                    help="In-file disk auto-prune: when free space drops below this, escalate pruning of transient artifacts and old checkpoints. 0 disables the floor (routine keep-count pruning still runs).")
     tr.add_argument("--heartbeat_every_sec", type=int, default=300,
                     help="Print lightweight trainer heartbeat/status lines every N seconds; 0 disables.")
     tr.add_argument("--empty_cache_every_steps", type=int, default=0,
