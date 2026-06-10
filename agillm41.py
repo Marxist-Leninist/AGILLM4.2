@@ -3464,9 +3464,20 @@ class PowerStep(torch.optim.Optimizer):
     Note: its update scale differs from Adam, so it needs its own LR (~1e-3 vs Adam's
     3e-4). The fp32 momentum buffer here lives in VRAM (~+3GB at 1B params); for the
     24GB 4090 a paged or int8-quantized buffer (per the paper) is the deployment path."""
-    def __init__(self, params, lr=1e-3, momentum=0.9, beta=0.1, weight_decay=0.0):
+    def __init__(self, params, lr=1e-3, momentum=0.9, beta=0.1, weight_decay=0.0,
+                 int8=False, paged=False):
         if not 0.0 <= beta <= 1.0:
             raise ValueError(f"beta must be in [0,1], got {beta}")
+        if int8 and paged:
+            raise ValueError("choose at most one of PowerStep int8 / paged")
+        # Memory modes for the single momentum buffer (VRAM is the constraint; RAM is cheap):
+        #   default  -> fp32 buffer in VRAM (fastest).
+        #   int8=True -> blockwise-int8 buffer in VRAM (paper's headline; ~1/4 VRAM).
+        #   paged=True -> fp32 buffer in pinned CPU RAM (~0 persistent VRAM; spends RAM+PCIe).
+        self._int8 = bool(int8); self._paged = bool(paged)
+        if self._int8:
+            import bitsandbytes.functional as _bnbF
+            self._bnbF = _bnbF
         super().__init__(params, dict(lr=lr, momentum=momentum, beta=beta, weight_decay=weight_decay))
 
     @torch.no_grad()
@@ -3482,11 +3493,26 @@ class PowerStep(torch.optim.Optimizer):
                     continue
                 g = p.grad
                 st = self.state[p]
-                if "m" not in st:
-                    st["m"] = torch.zeros_like(p)
-                m = st["m"]
-                m.mul_(gamma).add_(g)                       # heavy-ball momentum
-                u = m.sign() * m.abs().pow(beta)            # signed power transform
+                if self._int8:
+                    m = (torch.zeros_like(p, dtype=torch.float32) if "mq" not in st
+                         else self._bnbF.dequantize_blockwise(st["mq"], st["mstate"]))
+                    m.mul_(gamma).add_(g.float())
+                    u = (m.sign() * m.abs().pow(beta)).to(p.dtype)
+                    st["mq"], st["mstate"] = self._bnbF.quantize_blockwise(m)
+                elif self._paged:
+                    if "m" not in st:
+                        st["m"] = torch.zeros(p.shape, dtype=torch.float32,
+                                              pin_memory=torch.cuda.is_available())
+                    m = st["m"].to(p.device, non_blocking=True)
+                    m.mul_(gamma).add_(g.float())
+                    u = (m.sign() * m.abs().pow(beta)).to(p.dtype)
+                    st["m"].copy_(m, non_blocking=True)
+                else:
+                    if "m" not in st:
+                        st["m"] = torch.zeros_like(p)
+                    m = st["m"]
+                    m.mul_(gamma).add_(g)                   # heavy-ball momentum
+                    u = m.sign() * m.abs().pow(beta)        # signed power transform
                 if wd != 0:
                     p.mul_(1.0 - lr * wd)                   # decoupled weight decay
                 p.add_(u, alpha=-lr)
@@ -3502,7 +3528,9 @@ def make_optimizer(args, core, ar_h, sat_h, lr_core: float, lr_head: float, nat_
         return PowerStep(groups,
                          momentum=float(getattr(args, "powerstep_momentum", 0.9)),
                          beta=float(getattr(args, "powerstep_beta", 0.1)),
-                         weight_decay=float(getattr(args, "weight_decay", 0.0) or 0.0))
+                         weight_decay=float(getattr(args, "weight_decay", 0.0) or 0.0),
+                         int8=bool(getattr(args, "powerstep_int8", False)),
+                         paged=bool(getattr(args, "powerstep_paged", False)))
     if opt_name in {"adamw8bit", "paged_adamw8bit"}:
         try:
             import bitsandbytes as bnb
@@ -4436,6 +4464,10 @@ def main():
                     help="PowerStep signed-power exponent beta in (0,1); 0.1 is the paper's recommended value.")
     tr.add_argument("--powerstep_momentum", type=float, default=0.9,
                     help="PowerStep heavy-ball momentum coefficient gamma.")
+    tr.add_argument("--powerstep_int8", action="store_true",
+                    help="PowerStep: store the momentum buffer as blockwise int8 in VRAM (~1/4 VRAM; needs bitsandbytes).")
+    tr.add_argument("--powerstep_paged", action="store_true",
+                    help="PowerStep: keep the momentum buffer in pinned CPU RAM (~0 persistent VRAM, spends RAM+PCIe).")
     tr.add_argument("--save_every_sec", type=int, default=DEFAULT_SAVE_SEC)
     tr.add_argument("--disk_free_floor_gb", type=float, default=12.0,
                     help="In-file disk auto-prune: when free space drops below this, escalate pruning of transient artifacts and old checkpoints. 0 disables the floor (routine keep-count pruning still runs).")
