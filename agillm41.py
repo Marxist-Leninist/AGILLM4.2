@@ -3486,36 +3486,58 @@ class PowerStep(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        EPS = 1e-12
         for group in self.param_groups:
             lr = group["lr"]; gamma = group["momentum"]; beta = group["beta"]; wd = group["weight_decay"]
+            if self._int8 or self._paged:
+                # Per-tensor path (blockwise-int8 in VRAM, or fp32 buffer in CPU RAM).
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    g = p.grad
+                    st = self.state[p]
+                    if self._int8:
+                        m = (torch.zeros_like(p, dtype=torch.float32) if "mq" not in st
+                             else self._bnbF.dequantize_blockwise(st["mq"], st["mstate"]))
+                        m.mul_(gamma).add_(g.float())
+                        u = (m * (m.abs() + EPS).pow(beta - 1.0)).to(p.dtype)
+                        st["mq"], st["mstate"] = self._bnbF.quantize_blockwise(m)
+                    else:
+                        if "m" not in st:
+                            st["m"] = torch.zeros(p.shape, dtype=torch.float32,
+                                                  pin_memory=torch.cuda.is_available())
+                        m = st["m"].to(p.device, non_blocking=True)
+                        m.mul_(gamma).add_(g.float())
+                        u = (m * (m.abs() + EPS).pow(beta - 1.0)).to(p.dtype)
+                        st["m"].copy_(m, non_blocking=True)
+                    if wd != 0:
+                        p.mul_(1.0 - lr * wd)
+                    p.add_(u, alpha=-lr)
+                continue
+            # Fast multi-tensor (foreach) path for the default in-VRAM fp32 buffer:
+            # batches the elementwise update across all params -> few kernel launches,
+            # matching fused optimizers instead of one launch set per parameter.
+            params, grads, ms = [], [], []
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                g = p.grad
                 st = self.state[p]
-                if self._int8:
-                    m = (torch.zeros_like(p, dtype=torch.float32) if "mq" not in st
-                         else self._bnbF.dequantize_blockwise(st["mq"], st["mstate"]))
-                    m.mul_(gamma).add_(g.float())
-                    u = (m.sign() * m.abs().pow(beta)).to(p.dtype)
-                    st["mq"], st["mstate"] = self._bnbF.quantize_blockwise(m)
-                elif self._paged:
-                    if "m" not in st:
-                        st["m"] = torch.zeros(p.shape, dtype=torch.float32,
-                                              pin_memory=torch.cuda.is_available())
-                    m = st["m"].to(p.device, non_blocking=True)
-                    m.mul_(gamma).add_(g.float())
-                    u = (m.sign() * m.abs().pow(beta)).to(p.dtype)
-                    st["m"].copy_(m, non_blocking=True)
-                else:
-                    if "m" not in st:
-                        st["m"] = torch.zeros_like(p)
-                    m = st["m"]
-                    m.mul_(gamma).add_(g)                   # heavy-ball momentum
-                    u = m.sign() * m.abs().pow(beta)        # signed power transform
-                if wd != 0:
-                    p.mul_(1.0 - lr * wd)                   # decoupled weight decay
-                p.add_(u, alpha=-lr)
+                if "m" not in st:
+                    st["m"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                params.append(p); grads.append(p.grad); ms.append(st["m"])
+            if not params:
+                continue
+            # m = gamma*m + g
+            torch._foreach_mul_(ms, gamma)
+            torch._foreach_add_(ms, grads)
+            # u = sign(m)*|m|^beta = m * (|m|+eps)^(beta-1)   (avoids a separate sign pass)
+            absm = torch._foreach_abs(ms)
+            torch._foreach_add_(absm, EPS)
+            torch._foreach_pow_(absm, beta - 1.0)
+            us = torch._foreach_mul(ms, absm)
+            if wd != 0:
+                torch._foreach_mul_(params, 1.0 - lr * wd)
+            torch._foreach_add_(params, us, alpha=-lr)
         return loss
 
 
